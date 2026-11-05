@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ADEVIS Voice Bridge</title>
+<style>
+  :root{--bg:#f3f5fb;--card:#fff;--txt:#0f172a;--muted:#5b6782;--pri:#4f46e5;--err:#dc2626;--ok:#059669;--line:#dde3f0}
+  @media (prefers-color-scheme:dark){:root{--bg:#0b1220;--card:#121b2e;--txt:#e6ebf7;--muted:#93a1c0;--pri:#818cf8;--err:#f87171;--ok:#34d399;--line:#24314f}}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Noto Sans Thai",sans-serif;padding:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:24px 20px;width:100%;max-width:400px;text-align:center}
+  h1{font-size:17px;margin:0 0 4px;letter-spacing:.04em}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 18px}
+  .mic{width:96px;height:96px;border-radius:50%;border:0;background:linear-gradient(135deg,#4f46e5,#06b6d4);color:#fff;font-size:40px;cursor:pointer;touch-action:manipulation}
+  .mic.on{background:var(--err);animation:p 1s infinite}
+  @keyframes p{50%{box-shadow:0 0 0 14px rgba(220,38,38,.2)}}
+  .mic:disabled{opacity:.4;cursor:not-allowed}
+  #status{margin:16px 0 6px;font-weight:600}
+  #text{min-height:48px;font-size:16px;line-height:1.5;padding:10px;border-radius:12px;background:var(--bg);overflow-wrap:anywhere}
+  .err{color:var(--err)} .ok{color:var(--ok)}
+  .note{color:var(--muted);font-size:12px;margin-top:14px;line-height:1.6}
+  button.sec{margin-top:12px;border:1px solid var(--line);background:var(--card);color:var(--txt);border-radius:10px;padding:8px 16px;font:inherit;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>ADEVIS · Voice Bridge</h1>
+  <p class="sub">หน้าต่างไมโครโฟนสำหรับพูดสั่งงาน ADEVIS</p>
+  <button class="mic" id="mic" type="button" aria-label="เริ่มพูด">🎤</button>
+  <div id="status">กดปุ่มไมค์แล้วพูดภาษาไทย</div>
+  <div id="text" aria-live="polite"></div>
+  <button class="sec" id="cancel" type="button">ยกเลิกและปิด</button>
+  <div class="note">เปิดไมโครโฟนเฉพาะเมื่อคุณกดปุ่มหรือสั่งจาก ADEVIS · ไม่บันทึกเสียง ไม่เก็บข้อมูลใด ๆ ในหน้านี้<br>
+  การแปลงเสียงใช้บริการของเบราว์เซอร์ (Chrome/Edge ส่งเสียงไปแปลงที่ Google/Microsoft · Safari ใช้ของ Apple)<br>
+  ข้อความที่ได้จะส่งกลับไปที่หน้าต่าง ADEVIS ที่เปิดหน้านี้เท่านั้น</div>
+</div>
+<script>
+'use strict';
+(function () {
+  var q = new URLSearchParams(location.search);
+  var nonce = q.get('nonce') || '', origin = q.get('origin') || '', lang = q.get('lang') || 'th-TH';
+  // อนุญาตเฉพาะหน้าเว็บแอปของ Google Apps Script (และ localhost สำหรับทดสอบ)
+  var ORIGIN_OK = /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.googleusercontent\.com$/i.test(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d{2,5})?$/.test(origin);
+  var ERR = {
+    'not-allowed': 'ไม่ได้รับอนุญาตให้ใช้ไมโครโฟน — กดไอคอนแม่กุญแจที่แถบที่อยู่ เลือก "อนุญาต" แล้วลองใหม่',
+    'service-not-allowed': 'เบราว์เซอร์ไม่อนุญาตบริการแปลงเสียง', 'no-speech': 'ไม่ได้ยินเสียงพูด ลองใหม่อีกครั้ง',
+    'audio-capture': 'ไม่พบไมโครโฟน', 'network': 'อินเทอร์เน็ตขัดข้อง — การแปลงเสียงต้องใช้อินเทอร์เน็ต',
+    'language-not-supported': 'เบราว์เซอร์นี้ไม่รองรับภาษาไทย', 'unsupported': 'เบราว์เซอร์นี้ไม่รองรับการแปลงเสียง — ใช้ Chrome, Edge หรือ Safari'
+  };
+  var $ = function (id) { return document.getElementById(id); };
+  var Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var rec = null, listening = false, finalText = '', hadError = false, sent = false;
+
+  function status(t, cls) { var s = $('status'); s.textContent = t; s.className = cls || ''; }
+  function post(kind, extra) {
+    if (!window.opener || !ORIGIN_OK || !nonce) return false;
+    var m = { type: 'adevis-voice', kind: kind, nonce: nonce };
+    for (var k in extra) m[k] = extra[k];
+    try { window.opener.postMessage(m, origin); return true; } catch (e) { return false; }
+  }
+  function fail(code, retry) {
+    hadError = true; setOn(false);
+    status(ERR[code] || ('เกิดข้อผิดพลาด (' + code + ')'), 'err');
+    if (!retry) { post('error', { code: code }); sent = true; }
+  }
+  function setOn(on) { listening = on; $('mic').classList.toggle('on', on); $('mic').setAttribute('aria-label', on ? 'หยุด' : 'เริ่มพูด'); }
+
+  if (!ORIGIN_OK || !nonce) { $('mic').disabled = true; status('เปิดหน้านี้จากปุ่มไมค์ในแอป ADEVIS เท่านั้น', 'err'); return; }
+  if (!window.opener) { $('mic').disabled = true; status('ไม่พบหน้าต่าง ADEVIS ที่เปิดหน้านี้ — กดปุ่มไมค์ใน ADEVIS ใหม่อีกครั้ง', 'err'); return; }
+  if (!Ctor) { $('mic').disabled = true; fail('unsupported'); return; }
+
+  function start() {
+    if (listening) { try { rec.stop(); } catch (e) {} return; }
+    if (!navigator.onLine) return fail('network', true);
+    finalText = ''; hadError = false; $('text').textContent = '';
+    try { rec = new Ctor(); } catch (e) { return fail('unsupported'); }
+    rec.lang = lang; rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 1;
+    rec.onresult = function (ev) {
+      var interim = '';
+      for (var i = ev.resultIndex || 0; i < ev.results.length; i++) { var r = ev.results[i]; if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript; }
+      $('text').textContent = finalText + interim;
+      if (interim) post('interim', { text: (finalText + interim).slice(0, 300) });
+    };
+    rec.onerror = function (ev) { var c = ev.error || 'unsupported'; fail(c, c === 'no-speech' || c === 'aborted'); };
+    rec.onend = function () {
+      setOn(false);
+      if (hadError) return;
+      var t = finalText.replace(/\s+/g, ' ').trim();
+      if (!t) { status(ERR['no-speech'], 'err'); return; }
+      if (post('final', { text: t.slice(0, 2000) })) { sent = true; status('ส่งข้อความไปที่ ADEVIS แล้ว ✓', 'ok'); setTimeout(function () { window.close(); }, 700); }
+      else status('ส่งกลับไม่สำเร็จ — หน้าต่าง ADEVIS อาจถูกปิดไปแล้ว', 'err');
+    };
+    try { rec.start(); setOn(true); status('กำลังฟัง… พูดได้เลย'); } catch (e2) { fail('unsupported', true); }
+  }
+
+  $('mic').addEventListener('click', start);
+  $('cancel').addEventListener('click', function () { try { rec && rec.abort(); } catch (e) {} if (!sent) post('error', { code: 'aborted' }); window.close(); });
+  window.addEventListener('beforeunload', function () { try { rec && rec.abort(); } catch (e) {} });
+  post('ready', {});
+  if (q.get('autostart') === '1') start();
+})();
+</script>
+</body>
+</html>
