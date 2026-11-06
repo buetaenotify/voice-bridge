@@ -41,7 +41,7 @@
 (function () {
   var q = new URLSearchParams(location.search);
   var nonce = q.get('nonce') || '', origin = q.get('origin') || '', lang = q.get('lang') || 'th-TH';
-  var conv = q.get('conv') === '1', rate = Math.min(2, Math.max(0.5, Number(q.get('rate')) || 1)), VERSION = 2;
+  var conv = q.get('conv') === '1', rate = Math.min(2, Math.max(0.5, Number(q.get('rate')) || 1)), VERSION = 4;
   // อนุญาตเฉพาะหน้าเว็บแอปของ Google Apps Script (และ localhost สำหรับทดสอบ)
   var ORIGIN_OK = /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.googleusercontent\.com$/i.test(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d{2,5})?$/.test(origin);
   var ERR = {
@@ -100,14 +100,26 @@
   }
 
   /* โหมดสนทนา (v2): หน้าต่างนี้เปิดค้าง — รับคำสั่ง พูด/ฟัง/ปิด จากหน้าต่าง ADEVIS ที่เปิดมันเท่านั้น (ตรวจ origin + nonce) */
-  function say(text, then) {
+  var warnedTts = false;
+  function say(text, then, waited) {
     if (!('speechSynthesis' in window) || !text) { if (then) then(); return; }
+    var all = speechSynthesis.getVoices() || [];
+    if (!all.length && !waited) {   // รายชื่อเสียงยังโหลดไม่เสร็จ — รอก่อน ห้ามใช้เสียงเริ่มต้นที่อาจเป็นภาษาอังกฤษ
+      var go = function () { if (go.d) return; go.d = true; say(text, then, true); };
+      try { speechSynthesis.addEventListener('voiceschanged', go, { once: true }); } catch (e0) {}
+      setTimeout(go, 1500); return;
+    }
+    var th = all.filter(function (v) { return /^th/i.test(v.lang || ''); })[0];
+    if (!th) {
+      status('อุปกรณ์นี้ไม่มีเสียงอ่านภาษาไทย — ข้ามการอ่านออกเสียง (ดูคำตอบในหน้าต่าง ADEVIS)', 'err');
+      if (!warnedTts) { warnedTts = true; post('tts-missing', {}); }
+      if (then) setTimeout(then, 600); return;
+    }
     try { speechSynthesis.cancel(); } catch (e) {}
-    var th = (speechSynthesis.getVoices() || []).filter(function (v) { return /^th/i.test(v.lang || ''); })[0];
     var parts = String(text).match(/[\s\S]{1,160}(\s|$)/g) || [text], done = false;
     var fin = function () { if (done) return; done = true; if (then) then(); };
     status('ADEVIS กำลังพูด…');
-    parts.forEach(function (c, i) { var u = new SpeechSynthesisUtterance(c); u.lang = 'th-TH'; u.rate = rate; if (th) u.voice = th;
+    parts.forEach(function (c, i) { var u = new SpeechSynthesisUtterance(c); u.lang = th.lang || 'th-TH'; u.rate = rate; u.voice = th;
       if (i === parts.length - 1) { u.onend = fin; u.onerror = fin; } speechSynthesis.speak(u); });
     setTimeout(fin, Math.min(90000, 2500 + String(text).length * 110 / rate));
   }
@@ -115,7 +127,16 @@
     var d = ev.data;
     if (!conv || ev.source !== window.opener || ev.origin !== origin || !d || d.type !== 'adevis-voice-cmd' || d.nonce !== nonce) return;
     if (d.cmd === 'listen') { if (!listening) start(); }
-    else if (d.cmd === 'speak') { if (d.rate) rate = Math.min(2, Math.max(0.5, Number(d.rate) || 1)); say(String(d.text || '').slice(0, 3000), function () { post('spoken', {}); if (!listening) start(); }); }
+    else if (d.cmd === 'speak') {
+      if (d.rate) rate = Math.min(2, Math.max(0.5, Number(d.rate) || 1));
+      var after = function () { post('spoken', {}); if (!listening) start(); };
+      if (d.audio && /^[A-Za-z0-9+\/=]{100,}$/.test(String(d.audio))) {   // เสียงไทยที่ ADEVIS สร้างด้วย Gemini (MP3)
+        try { speechSynthesis.cancel(); } catch (e0) {}
+        var au = new Audio('data:audio/mpeg;base64,' + d.audio), fin = false, end = function () { if (fin) return; fin = true; after(); };
+        au.playbackRate = rate; au.onended = end; au.onerror = function () { fin = true; say(String(d.text || '').slice(0, 3000), after); };
+        status('ADEVIS กำลังพูด…'); var pr = au.play(); if (pr && pr.catch) pr.catch(function () { if (!fin) { fin = true; say(String(d.text || '').slice(0, 3000), after); } });
+      } else say(String(d.text || '').slice(0, 3000), after);
+    }
     else if (d.cmd === 'stop') { try { rec && rec.abort(); } catch (e) {} try { speechSynthesis.cancel(); } catch (e2) {} sent = true; window.close(); }
   });
 
