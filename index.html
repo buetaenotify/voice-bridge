@@ -41,6 +41,7 @@
 (function () {
   var q = new URLSearchParams(location.search);
   var nonce = q.get('nonce') || '', origin = q.get('origin') || '', lang = q.get('lang') || 'th-TH';
+  var conv = q.get('conv') === '1', rate = Math.min(2, Math.max(0.5, Number(q.get('rate')) || 1)), VERSION = 2;
   // อนุญาตเฉพาะหน้าเว็บแอปของ Google Apps Script (และ localhost สำหรับทดสอบ)
   var ORIGIN_OK = /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.googleusercontent\.com$/i.test(origin) || /^http:\/\/(localhost|127\.0\.0\.1)(:\d{2,5})?$/.test(origin);
   var ERR = {
@@ -83,22 +84,46 @@
       $('text').textContent = finalText + interim;
       if (interim) post('interim', { text: (finalText + interim).slice(0, 300) });
     };
-    rec.onerror = function (ev) { var c = ev.error || 'unsupported'; fail(c, c === 'no-speech' || c === 'aborted'); };
+    rec.onerror = function (ev) { var c = ev.error || 'unsupported'; if (conv && c === 'no-speech') { hadError = true; setOn(false); status(ERR['no-speech'], 'err'); post('error', { code: 'no-speech' }); return; } fail(c, c === 'no-speech' || c === 'aborted'); };
     rec.onend = function () {
       setOn(false);
       if (hadError) return;
       var t = finalText.replace(/\s+/g, ' ').trim();
-      if (!t) { status(ERR['no-speech'], 'err'); return; }
-      if (post('final', { text: t.slice(0, 2000) })) { sent = true; status('ส่งข้อความไปที่ ADEVIS แล้ว ✓', 'ok'); setTimeout(function () { window.close(); }, 700); }
+      if (!t) { status(ERR['no-speech'], 'err'); if (conv) post('error', { code: 'no-speech' }); return; }
+      if (post('final', { text: t.slice(0, 2000) })) {
+        if (conv) { status('ส่งแล้ว — รอ ADEVIS ตอบ…', 'ok'); return; }
+        sent = true; status('ส่งข้อความไปที่ ADEVIS แล้ว ✓', 'ok'); setTimeout(function () { window.close(); }, 700);
+      }
       else status('ส่งกลับไม่สำเร็จ — หน้าต่าง ADEVIS อาจถูกปิดไปแล้ว', 'err');
     };
     try { rec.start(); setOn(true); status('กำลังฟัง… พูดได้เลย'); } catch (e2) { fail('unsupported', true); }
   }
 
+  /* โหมดสนทนา (v2): หน้าต่างนี้เปิดค้าง — รับคำสั่ง พูด/ฟัง/ปิด จากหน้าต่าง ADEVIS ที่เปิดมันเท่านั้น (ตรวจ origin + nonce) */
+  function say(text, then) {
+    if (!('speechSynthesis' in window) || !text) { if (then) then(); return; }
+    try { speechSynthesis.cancel(); } catch (e) {}
+    var th = (speechSynthesis.getVoices() || []).filter(function (v) { return /^th/i.test(v.lang || ''); })[0];
+    var parts = String(text).match(/[\s\S]{1,160}(\s|$)/g) || [text], done = false;
+    var fin = function () { if (done) return; done = true; if (then) then(); };
+    status('ADEVIS กำลังพูด…');
+    parts.forEach(function (c, i) { var u = new SpeechSynthesisUtterance(c); u.lang = 'th-TH'; u.rate = rate; if (th) u.voice = th;
+      if (i === parts.length - 1) { u.onend = fin; u.onerror = fin; } speechSynthesis.speak(u); });
+    setTimeout(fin, Math.min(90000, 2500 + String(text).length * 110 / rate));
+  }
+  window.addEventListener('message', function (ev) {
+    var d = ev.data;
+    if (!conv || ev.source !== window.opener || ev.origin !== origin || !d || d.type !== 'adevis-voice-cmd' || d.nonce !== nonce) return;
+    if (d.cmd === 'listen') { if (!listening) start(); }
+    else if (d.cmd === 'speak') { if (d.rate) rate = Math.min(2, Math.max(0.5, Number(d.rate) || 1)); say(String(d.text || '').slice(0, 3000), function () { post('spoken', {}); if (!listening) start(); }); }
+    else if (d.cmd === 'stop') { try { rec && rec.abort(); } catch (e) {} try { speechSynthesis.cancel(); } catch (e2) {} sent = true; window.close(); }
+  });
+
   $('mic').addEventListener('click', start);
   $('cancel').addEventListener('click', function () { try { rec && rec.abort(); } catch (e) {} if (!sent) post('error', { code: 'aborted' }); window.close(); });
   window.addEventListener('beforeunload', function () { try { rec && rec.abort(); } catch (e) {} });
-  post('ready', {});
+  post('ready', { version: VERSION, conv: conv });
+  if (conv) { document.querySelector('.sub').textContent = 'โหมดสนทนา — เปิดหน้าต่างนี้ไว้ระหว่างคุย · พูดว่า "พอแล้ว" เพื่อจบ'; $('cancel').textContent = 'จบการสนทนาและปิด'; }
   if (q.get('autostart') === '1') start();
 })();
 </script>
